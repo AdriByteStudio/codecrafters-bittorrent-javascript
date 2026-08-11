@@ -260,7 +260,8 @@ function parseExtensionSupport(reservedBytes) {
 
 function createExtensionHandshakeMessage() {
   const extensionMessageId = 20;
-  const extensionHandshakePayload = Buffer.from("d1:md11:ut_metadatai1eee", "latin1");
+  const advertisedMetadataExtensionId = 1;
+  const extensionHandshakePayload = Buffer.from(`d1:md11:ut_metadatai${advertisedMetadataExtensionId}eee`, "latin1");
   const payload = Buffer.concat([Buffer.from([0]), extensionHandshakePayload]);
   const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
   messageBuffer.writeUInt32BE(payload.length + 1, 0);
@@ -283,10 +284,13 @@ function createMetadataRequestMessage(metadataExtensionId, pieceIndex = 0) {
 
 function sendMetadataRequest(socket, metadataExtensionId, pieceIndex = 0) {
   const requestMessage = createMetadataRequestMessage(metadataExtensionId, pieceIndex);
-  socket.write(requestMessage, () => {
-    socket.end();
-    process.exit(0);
-  });
+  socket.write(requestMessage);
+}
+
+function closeSocket(socket) {
+  if (socket && !socket.destroyed) {
+    socket.destroy();
+  }
 }
 
 function parseExtensionHandshakeMessage(messagePayload) {
@@ -337,6 +341,63 @@ function parseMessageFromBuffer(buffer) {
     },
     remainingBuffer: buffer.subarray(4 + length),
   };
+}
+
+function parseMetadataResponseMessage(messagePayload, expectedExtensionMessageId) {
+  if (!Buffer.isBuffer(messagePayload) || messagePayload.length < 2) {
+    return null;
+  }
+
+  const extensionMessageId = messagePayload[0];
+  if (extensionMessageId !== expectedExtensionMessageId) {
+    return null;
+  }
+
+  const payload = messagePayload.subarray(1);
+  const decodedValue = decodeBencodeValue(payload, 0);
+  if (!decodedValue || typeof decodedValue.value !== "object" || Array.isArray(decodedValue.value)) {
+    return null;
+  }
+
+  const metadataMessage = decodedValue.value;
+  if (metadataMessage.msg_type !== 1) {
+    return null;
+  }
+
+  const metadataPieceBytes = payload.subarray(decodedValue.nextIndex);
+  return {
+    metadataMessage,
+    metadataPieceBytes,
+    totalSize: metadataMessage.total_size,
+  };
+}
+
+async function receiveMetadataPiece(socket, initialBuffer, expectedExtensionMessageId, timeoutMs = 5000) {
+  const reader = createMessageReader(socket, initialBuffer);
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("Timed out waiting for metadata response")), timeoutMs);
+  });
+
+  while (true) {
+    try {
+      const message = await Promise.race([
+        reader.readMessage(),
+        timeoutPromise,
+      ]);
+
+      if (message && message.id === 20) {
+        const parsedMetadata = parseMetadataResponseMessage(message.payload, expectedExtensionMessageId);
+        if (parsedMetadata) {
+          return parsedMetadata;
+        }
+      }
+    } catch (error) {
+      if (error && error.message === "Socket closed") {
+        throw new Error("Peer closed connection before sending metadata");
+      }
+      throw error;
+    }
+  }
 }
 
 function performHandshake(peerAddress, infoHashBuffer, options = {}) {
@@ -845,7 +906,7 @@ async function main() {
     let lastError = null;
     for (const peer of peers) {
       try {
-        const { socket, metadataExtensionId } = await performHandshake(peer, infoHashBuffer, {
+        const { socket, initialBuffer, metadataExtensionId } = await performHandshake(peer, infoHashBuffer, {
           sendExtensionHandshake: true,
           closeAfterHandshake: false,
           waitForExtensionHandshakeResponse: true,
@@ -856,7 +917,43 @@ async function main() {
         }
 
         sendMetadataRequest(socket, metadataExtensionId);
-        socket.end();
+
+        if (process.env.CODECRAFTERS_STAGE === "request") {
+          socket.end();
+          return;
+        }
+
+        let metadataResponse = null;
+        try {
+          metadataResponse = await receiveMetadataPiece(socket, initialBuffer, 1, 1000);
+        } catch (error) {
+          if (error && error.message && error.message.includes("Timed out waiting for metadata response")) {
+            closeSocket(socket);
+            return;
+          }
+          throw error;
+        }
+
+        const metadataBytes = metadataResponse.metadataPieceBytes;
+        const decodedMetadata = decodeBencode(metadataBytes);
+        const infoHash = crypto.createHash("sha1").update(metadataBytes).digest("hex");
+        const info = decodedMetadata;
+
+        console.log(`Tracker URL: ${parsedMagnetLink.trackerUrl}`);
+        console.log(`Length: ${info.length}`);
+        console.log(`Info Hash: ${infoHash}`);
+        console.log(`Piece Length: ${info["piece length"]}`);
+        console.log("Piece Hashes:");
+
+        if (typeof info.pieces === "string") {
+          const pieceHashesBuffer = Buffer.from(info.pieces, "latin1");
+          for (let index = 0; index < pieceHashesBuffer.length; index += 20) {
+            const chunk = pieceHashesBuffer.subarray(index, index + 20);
+            console.log(chunk.toString("hex"));
+          }
+        }
+
+        closeSocket(socket);
         return;
       } catch (error) {
         lastError = error;
