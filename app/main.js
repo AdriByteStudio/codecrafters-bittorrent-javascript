@@ -3,6 +3,7 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const net = require("net");
+const path = require("path");
 const process = require("process");
 const util = require("util");
 
@@ -223,27 +224,25 @@ function performHandshake(peerAddress, infoHashBuffer) {
     }
 
     const socket = net.createConnection({ host, port });
+    let buffer = Buffer.alloc(0);
     const timeout = setTimeout(() => {
       socket.destroy();
       reject(new Error("Handshake timed out"));
     }, 5000);
 
     socket.on("connect", () => {
-      const { handshake, peerId } = createHandshake(infoHashBuffer);
+      const { handshake } = createHandshake(infoHashBuffer);
       socket.write(handshake);
     });
 
     socket.on("data", (data) => {
-      clearTimeout(timeout);
-      if (data.length < 68) {
-        socket.destroy();
-        reject(new Error("Handshake response was too short"));
-        return;
+      buffer = Buffer.concat([buffer, data]);
+      if (buffer.length >= 68) {
+        clearTimeout(timeout);
+        const peerId = buffer.subarray(48, 68).toString("hex");
+        const remainingBuffer = buffer.subarray(68);
+        resolve({ socket, peerId, initialBuffer: remainingBuffer });
       }
-
-      const peerId = data.subarray(48, 68).toString("hex");
-      socket.end();
-      resolve(peerId);
     });
 
     socket.on("error", (error) => {
@@ -251,6 +250,132 @@ function performHandshake(peerAddress, infoHashBuffer) {
       reject(error);
     });
   });
+}
+
+function createMessageReader(socket, initialBuffer = Buffer.alloc(0)) {
+  let buffer = initialBuffer;
+  const pending = [];
+
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    processMessages();
+  });
+
+  socket.on("error", (error) => {
+    while (pending.length > 0) {
+      pending.shift().reject(error);
+    }
+  });
+
+  socket.on("end", () => {
+    while (pending.length > 0) {
+      pending.shift().reject(new Error("Socket closed"));
+    }
+  });
+
+  function processMessages() {
+    while (buffer.length >= 4) {
+      const length = buffer.readUInt32BE(0);
+      if (length === 0) {
+        buffer = buffer.subarray(4);
+        continue;
+      }
+
+      if (buffer.length < 4 + length) {
+        return;
+      }
+
+      const messageBuffer = buffer.subarray(4, 4 + length);
+      buffer = buffer.subarray(4 + length);
+      const message = {
+        length,
+        id: messageBuffer[0],
+        payload: messageBuffer.subarray(1),
+      };
+
+      const next = pending.shift();
+      if (next) {
+        next.resolve(message);
+      }
+    }
+  }
+
+  return {
+    readMessage() {
+      return new Promise((resolve, reject) => {
+        pending.push({ resolve, reject });
+        processMessages();
+      });
+    },
+  };
+}
+
+function sendMessage(socket, messageId, payload = Buffer.alloc(0)) {
+  const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
+  messageBuffer.writeUInt32BE(1 + payload.length, 0);
+  messageBuffer[4] = messageId;
+  payload.copy(messageBuffer, 5);
+  socket.write(messageBuffer);
+}
+
+async function downloadPieceFromPeer(peerAddress, infoHashBuffer, pieceIndex, pieceHashes, pieceLength, totalLength) {
+  const { socket, peerId, initialBuffer } = await performHandshake(peerAddress, infoHashBuffer);
+  const reader = createMessageReader(socket, initialBuffer);
+
+  let message = await reader.readMessage();
+  while (message.id !== 5 && message.id !== 1) {
+    message = await reader.readMessage();
+  }
+
+  sendMessage(socket, 2);
+
+  while (message.id !== 1) {
+    message = await reader.readMessage();
+  }
+
+  const blockSize = 16 * 1024;
+  const pieceSize = pieceIndex + 1 === Math.ceil(totalLength / pieceLength) ? totalLength - pieceIndex * pieceLength : pieceLength;
+  const pieceBuffer = Buffer.alloc(pieceSize);
+  let offset = 0;
+
+  while (offset < pieceSize) {
+    const blockLength = Math.min(blockSize, pieceSize - offset);
+    const requestPayload = Buffer.alloc(12);
+    requestPayload.writeUInt32BE(pieceIndex, 0);
+    requestPayload.writeUInt32BE(offset, 4);
+    requestPayload.writeUInt32BE(blockLength, 8);
+    sendMessage(socket, 6, requestPayload);
+
+    const pieceMessage = await reader.readMessage();
+    if (pieceMessage.id !== 7) {
+      continue;
+    }
+
+    const payload = pieceMessage.payload;
+    if (payload.length < 8) {
+      throw new Error("Invalid piece message");
+    }
+
+    const messagePieceIndex = payload.readUInt32BE(0);
+    const begin = payload.readUInt32BE(4);
+    const block = payload.subarray(8);
+
+    if (messagePieceIndex !== pieceIndex || begin !== offset) {
+      throw new Error("Unexpected piece message payload");
+    }
+
+    block.copy(pieceBuffer, begin);
+    offset += block.length;
+  }
+
+  const expectedHash = Buffer.from(pieceHashes.slice(pieceIndex * 20, pieceIndex * 20 + 20), "latin1").toString("hex");
+  const actualHash = crypto.createHash("sha1").update(pieceBuffer).digest("hex");
+  if (actualHash !== expectedHash) {
+    throw new Error("Downloaded piece hash mismatch");
+  }
+
+  socket.end();
+  return { peerId, pieceBuffer };
 }
 
 async function main() {
@@ -342,8 +467,52 @@ async function main() {
     }
 
     const infoHashBuffer = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest();
-    const peerId = await performHandshake(peerAddress, infoHashBuffer);
+    const { peerId } = await performHandshake(peerAddress, infoHashBuffer);
     console.log(`Peer ID: ${peerId}`);
+  } else if (command === "download_piece") {
+    const outputPath = process.argv[process.argv.indexOf("-o") + 1];
+    const torrentPath = process.argv[process.argv.indexOf("-o") + 2];
+    const pieceIndex = Number(process.argv[process.argv.indexOf("-o") + 3]);
+    const torrentData = fs.readFileSync(torrentPath);
+    const decodedTorrent = decodeBencodeWithMetadata(torrentData);
+
+    if (!decodedTorrent.value || typeof decodedTorrent.value !== "object" || Array.isArray(decodedTorrent.value)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const trackerUrl = decodedTorrent.value.announce;
+    const fileInfo = decodedTorrent.value.info;
+
+    if (typeof trackerUrl !== "string" || !fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const infoHashBuffer = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest();
+    const trackerResponse = await requestTracker(trackerUrl, infoHashBuffer, fileInfo.length);
+    const decodedResponse = decodeBencode(trackerResponse);
+
+    if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+      throw new Error("Invalid tracker response");
+    }
+
+    const peers = parseCompactPeers(decodedResponse.peers);
+    let downloadedPiece = null;
+
+    for (const peer of peers) {
+      try {
+        downloadedPiece = await downloadPieceFromPeer(peer, infoHashBuffer, pieceIndex, fileInfo.pieces, fileInfo["piece length"], fileInfo.length);
+        break;
+      } catch (error) {
+        continue;
+      }
+    }
+
+    if (!downloadedPiece) {
+      throw new Error("Failed to download piece from any peer");
+    }
+
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, downloadedPiece.pieceBuffer);
   } else {
     throw new Error(`Unknown command ${command}`);
   }
