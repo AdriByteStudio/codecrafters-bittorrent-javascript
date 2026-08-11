@@ -1,3 +1,4 @@
+const fs = require("fs");
 const process = require("process");
 const util = require("util");
 
@@ -104,16 +105,33 @@ function main() {
   // You can use print statements as follows for debugging, they'll be visible when running tests.
   console.error("Logs from your program will appear here!");
 
-  // TODO: Uncomment the code below to pass the first stage
-   if (command === "decode") {
-     const bencodedValue = process.argv[3];
-  
-     // In JavaScript, there's no need to manually convert bytes to string for printing
-     // because JS doesn't distinguish between bytes and strings in the same way Python does.
-     console.log(JSON.stringify(decodeBencode(bencodedValue)));
-   } else {
-     throw new Error(`Unknown command ${command}`);
-   }
+  if (command === "decode") {
+    const bencodedValue = process.argv[3];
+
+    // In JavaScript, there's no need to manually convert bytes to string for printing
+    // because JS doesn't distinguish between bytes and strings in the same way Python does.
+    console.log(JSON.stringify(decodeBencode(bencodedValue)));
+  } else if (command === "info") {
+    const torrentPath = process.argv[3];
+    const torrentData = fs.readFileSync(torrentPath).toString("latin1");
+    const decodedTorrent = decodeBencode(torrentData);
+
+    if (!decodedTorrent || typeof decodedTorrent !== "object" || Array.isArray(decodedTorrent)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const trackerUrl = decodedTorrent.announce;
+    const fileInfo = decodedTorrent.info;
+
+    if (typeof trackerUrl !== "string" || !fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    console.log(`Tracker URL: ${trackerUrl}`);
+    console.log(`Length: ${fileInfo.length}`);
+  } else {
+    throw new Error(`Unknown command ${command}`);
+  }
 }
 
 main();
