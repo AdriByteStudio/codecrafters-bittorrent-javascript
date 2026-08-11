@@ -1,5 +1,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const process = require("process");
 const util = require("util");
 
@@ -138,10 +140,66 @@ function decodeBencodeWithMetadata(bencodedValue) {
   };
 }
 
-function main() {
+function makeTrackerRequestUrl(trackerUrl, infoHashBuffer, left) {
+  const encodedInfoHash = Array.from(infoHashBuffer)
+    .map((byte) => `%${byte.toString(16).padStart(2, "0")}`)
+    .join("");
+
+  const params = [
+    `info_hash=${encodedInfoHash}`,
+    `peer_id=-CC0001-123456789012`,
+    "port=6881",
+    "uploaded=0",
+    "downloaded=0",
+    `left=${left}`,
+    "compact=1",
+  ];
+
+  const separator = trackerUrl.includes("?") ? "&" : "?";
+  return `${trackerUrl}${separator}${params.join("&")}`;
+}
+
+function requestTracker(trackerUrl, infoHashBuffer, left) {
+  const requestUrl = makeTrackerRequestUrl(trackerUrl, infoHashBuffer, left);
+
+  return new Promise((resolve, reject) => {
+    const transport = requestUrl.startsWith("https://") ? https : http;
+    const request = transport.get(requestUrl, (response) => {
+      if (response.statusCode && response.statusCode >= 400) {
+        reject(new Error(`Tracker request failed with status ${response.statusCode}`));
+        response.resume();
+        return;
+      }
+
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      response.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+
+    request.on("error", reject);
+  });
+}
+
+function parseCompactPeers(peersString) {
+  const peersBuffer = Buffer.from(peersString, "latin1");
+  const peers = [];
+
+  for (let index = 0; index + 6 <= peersBuffer.length; index += 6) {
+    const peerBuffer = peersBuffer.subarray(index, index + 6);
+    const ipAddress = Array.from(peerBuffer.subarray(0, 4))
+      .map((byte) => String(byte))
+      .join(".");
+    const port = peerBuffer.readUInt16BE(4);
+    peers.push(`${ipAddress}:${port}`);
+  }
+
+  return peers;
+}
+
+async function main() {
   const command = process.argv[2];
 
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
+  // You can use print statements as follows for debugging, they'll be visible here.
   console.error("Logs from your program will appear here!");
 
   if (command === "decode") {
@@ -183,9 +241,40 @@ function main() {
         console.log(hex);
       }
     }
+  } else if (command === "peers") {
+    const torrentPath = process.argv[3];
+    const torrentData = fs.readFileSync(torrentPath);
+    const decodedTorrent = decodeBencodeWithMetadata(torrentData);
+
+    if (!decodedTorrent.value || typeof decodedTorrent.value !== "object" || Array.isArray(decodedTorrent.value)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const trackerUrl = decodedTorrent.value.announce;
+    const fileInfo = decodedTorrent.value.info;
+
+    if (typeof trackerUrl !== "string" || !fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const infoHash = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest("hex");
+    const trackerResponse = await requestTracker(trackerUrl, Buffer.from(infoHash, "hex"), fileInfo.length);
+    const decodedResponse = decodeBencode(trackerResponse);
+
+    if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+      throw new Error("Invalid tracker response");
+    }
+
+    const peers = parseCompactPeers(decodedResponse.peers);
+    for (const peer of peers) {
+      console.log(peer);
+    }
   } else {
     throw new Error(`Unknown command ${command}`);
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});
