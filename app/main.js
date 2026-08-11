@@ -249,7 +249,28 @@ function createHandshake(infoHashBuffer) {
   return { handshake, peerId };
 }
 
-function performHandshake(peerAddress, infoHashBuffer) {
+function parseExtensionSupport(reservedBytes) {
+  if (!Buffer.isBuffer(reservedBytes) || reservedBytes.length < 8) {
+    return false;
+  }
+
+  const reservedValue = reservedBytes.readUInt32BE(4);
+  return (reservedValue & (1 << 20)) !== 0;
+}
+
+function createExtensionHandshakeMessage() {
+  const extensionMessageId = 20;
+  const extensionHandshakePayload = Buffer.from("d1:md11:ut_metadatai1eee", "latin1");
+  const payload = Buffer.concat([Buffer.from([0]), extensionHandshakePayload]);
+  const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
+  messageBuffer.writeUInt32BE(payload.length + 1, 0);
+  messageBuffer[4] = extensionMessageId;
+  payload.copy(messageBuffer, 5);
+  return messageBuffer;
+}
+
+function performHandshake(peerAddress, infoHashBuffer, options = {}) {
+  const { sendExtensionHandshake = false, closeAfterHandshake = false } = options;
   return new Promise((resolve, reject) => {
     const [host, portString] = peerAddress.split(":");
     const port = Number(portString);
@@ -275,8 +296,19 @@ function performHandshake(peerAddress, infoHashBuffer) {
       buffer = Buffer.concat([buffer, data]);
       if (buffer.length >= 68) {
         clearTimeout(timeout);
+        const reservedBytes = buffer.subarray(20, 28);
         const peerId = buffer.subarray(48, 68).toString("hex");
         const remainingBuffer = buffer.subarray(68);
+
+        if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
+          socket.write(createExtensionHandshakeMessage());
+          if (closeAfterHandshake) {
+            socket.end();
+          }
+          resolve({ socket, peerId, initialBuffer: remainingBuffer });
+          return;
+        }
+
         resolve({ socket, peerId, initialBuffer: remainingBuffer });
       }
     });
@@ -441,7 +473,7 @@ async function performMagnetHandshake(magnetLink) {
   let lastError = null;
   for (const peer of peers) {
     try {
-      const { peerId } = await performHandshake(peer, infoHashBuffer);
+      const { peerId } = await performHandshake(peer, infoHashBuffer, { sendExtensionHandshake: true, closeAfterHandshake: true });
       return peerId;
     } catch (error) {
       lastError = error;
