@@ -1151,13 +1151,78 @@ async function main() {
         const numberOfPieces = Math.ceil(totalLength / pieceLength);
         const fileBuffer = Buffer.alloc(totalLength);
 
-        // Download all pieces
-        for (let pieceIndex = 0; pieceIndex < numberOfPieces; pieceIndex += 1) {
-          const isLastPiece = pieceIndex === numberOfPieces - 1;
-          const downloadedPiece = await downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength, null, isLastPiece);
-          downloadedPiece.pieceBuffer.copy(fileBuffer, pieceIndex * pieceLength);
+        // Send interested once for all pieces
+        sendMessage(socket, 2);
+        
+        // Wait for unchoke once
+        let message = await reader.readMessage();
+        while (message.id !== 1) {
+          message = await reader.readMessage();
         }
 
+        // Download all pieces with pipelining
+        const blockSize = 16 * 1024;
+        const pendingRequests = new Map(); // Maps "pieceIndex:blockOffset" -> blockLength
+        let currentPieceIndex = 0;
+        let currentBlockOffset = 0;
+        const maxPendingRequests = 5;
+
+        while (currentPieceIndex < numberOfPieces || pendingRequests.size > 0) {
+          // Send requests to fill up to maxPendingRequests
+          while (currentPieceIndex < numberOfPieces && pendingRequests.size < maxPendingRequests) {
+            const isLastPiece = currentPieceIndex + 1 === numberOfPieces;
+            const pieceSizeForCurrentPiece = isLastPiece ? totalLength - currentPieceIndex * pieceLength : pieceLength;
+
+            if (currentBlockOffset < pieceSizeForCurrentPiece) {
+              const blockLength = Math.min(blockSize, pieceSizeForCurrentPiece - currentBlockOffset);
+              const requestPayload = Buffer.alloc(12);
+              requestPayload.writeUInt32BE(currentPieceIndex, 0);
+              requestPayload.writeUInt32BE(currentBlockOffset, 4);
+              requestPayload.writeUInt32BE(blockLength, 8);
+              sendMessage(socket, 6, requestPayload);
+              
+              pendingRequests.set(`${currentPieceIndex}:${currentBlockOffset}`, blockLength);
+              currentBlockOffset += blockLength;
+            } else {
+              // Move to next piece
+              currentPieceIndex += 1;
+              currentBlockOffset = 0;
+            }
+          }
+
+          // Read response
+          if (pendingRequests.size > 0) {
+            const pieceMessage = await reader.readMessage();
+            if (pieceMessage.id === 7) {
+              const payload = pieceMessage.payload;
+              if (payload.length >= 8) {
+                const messagePieceIndex = payload.readUInt32BE(0);
+                const begin = payload.readUInt32BE(4);
+                const block = payload.subarray(8);
+                
+                const blockKey = `${messagePieceIndex}:${begin}`;
+                if (pendingRequests.has(blockKey)) {
+                  block.copy(fileBuffer, messagePieceIndex * pieceLength + begin);
+                  pendingRequests.delete(blockKey);
+                }
+              }
+            }
+          }
+        }
+
+        // Verify all pieces
+        for (let pieceIndex = 0; pieceIndex < numberOfPieces; pieceIndex += 1) {
+          const isLastPiece = pieceIndex + 1 === numberOfPieces;
+          const pieceSizeForCurrentPiece = isLastPiece ? totalLength - pieceIndex * pieceLength : pieceLength;
+          const pieceBuffer = fileBuffer.subarray(pieceIndex * pieceLength, pieceIndex * pieceLength + pieceSizeForCurrentPiece);
+          const expectedHash = Buffer.from(pieceHashes.slice(pieceIndex * 20, pieceIndex * 20 + 20), "latin1").toString("hex");
+          const actualHash = crypto.createHash("sha1").update(pieceBuffer).digest("hex");
+          if (actualHash !== expectedHash) {
+            throw new Error(`Piece ${pieceIndex} hash mismatch`);
+          }
+        }
+
+        socket.end();
         fs.mkdirSync(path.dirname(outputPath), { recursive: true });
         fs.writeFileSync(outputPath, fileBuffer);
         return;
