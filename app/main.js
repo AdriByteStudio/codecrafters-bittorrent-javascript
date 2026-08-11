@@ -40,6 +40,30 @@ function decodeBencodeValue(bencodedValue, startIndex) {
     return { value: values, nextIndex: index + 1 };
   }
 
+  if (currentChar === "d") {
+    const object = {};
+    let index = startIndex + 1;
+
+    while (index < bencodedValue.length && bencodedValue[index] !== "e") {
+      const keyDecoded = decodeBencodeValue(bencodedValue, index);
+      if (typeof keyDecoded.value !== "string") {
+        throw new Error("Dictionary keys must be strings");
+      }
+
+      index = keyDecoded.nextIndex;
+
+      const valueDecoded = decodeBencodeValue(bencodedValue, index);
+      object[keyDecoded.value] = valueDecoded.value;
+      index = valueDecoded.nextIndex;
+    }
+
+    if (index >= bencodedValue.length || bencodedValue[index] !== "e") {
+      throw new Error("Invalid encoded value");
+    }
+
+    return { value: object, nextIndex: index + 1 };
+  }
+
   if (!isNaN(currentChar)) {
     const firstColonIndex = bencodedValue.indexOf(":", startIndex);
     if (firstColonIndex === -1) {
