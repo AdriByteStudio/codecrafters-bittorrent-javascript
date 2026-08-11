@@ -167,10 +167,22 @@ function main() {
     }
 
     const infoHash = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest("hex");
+    const pieceLength = fileInfo["piece length"];
+    const pieceHashes = fileInfo.pieces;
 
     console.log(`Tracker URL: ${trackerUrl}`);
     console.log(`Length: ${fileInfo.length}`);
     console.log(`Info Hash: ${infoHash}`);
+    console.log(`Piece Length: ${pieceLength}`);
+    console.log("Piece Hashes:");
+
+    if (typeof pieceHashes === "string") {
+      for (let index = 0; index < pieceHashes.length; index += 20) {
+        const chunk = pieceHashes.slice(index, index + 20);
+        const hex = Buffer.from(chunk, "latin1").toString("hex");
+        console.log(hex);
+      }
+    }
   } else {
     throw new Error(`Unknown command ${command}`);
   }
