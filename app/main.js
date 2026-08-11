@@ -282,7 +282,11 @@ function createMetadataRequestMessage(metadataExtensionId, pieceIndex = 0) {
 }
 
 function sendMetadataRequest(socket, metadataExtensionId, pieceIndex = 0) {
-  socket.end(createMetadataRequestMessage(metadataExtensionId, pieceIndex));
+  const requestMessage = createMetadataRequestMessage(metadataExtensionId, pieceIndex);
+  socket.write(requestMessage, () => {
+    socket.end();
+    process.exit(0);
+  });
 }
 
 function parseExtensionHandshakeMessage(messagePayload) {
