@@ -293,6 +293,7 @@ function createMessageReader(socket, initialBuffer = Buffer.alloc(0)) {
         payload: messageBuffer.subarray(1),
       };
 
+      console.error(`Received message id=${message.id} length=${message.length}`);
       const next = pending.shift();
       if (next) {
         next.resolve(message);
@@ -312,6 +313,7 @@ function createMessageReader(socket, initialBuffer = Buffer.alloc(0)) {
 
 function sendMessage(socket, messageId, payload = Buffer.alloc(0)) {
   const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
+  console.error(`Sending message id=${messageId}`);
   messageBuffer.writeUInt32BE(1 + payload.length, 0);
   messageBuffer[4] = messageId;
   payload.copy(messageBuffer, 5);
@@ -322,14 +324,17 @@ async function downloadPieceFromPeer(peerAddress, infoHashBuffer, pieceIndex, pi
   const { socket, peerId, initialBuffer } = await performHandshake(peerAddress, infoHashBuffer);
   const reader = createMessageReader(socket, initialBuffer);
 
+console.error(`Starting piece download for piece ${pieceIndex}`);
   let message = await reader.readMessage();
   while (message.id !== 5 && message.id !== 1) {
+    console.error(`Skipping unexpected message id=${message.id}`);
     message = await reader.readMessage();
   }
 
   sendMessage(socket, 2);
 
   while (message.id !== 1) {
+    console.error(`Waiting for unchoke, got id=${message.id}`);
     message = await reader.readMessage();
   }
 
@@ -503,6 +508,7 @@ async function main() {
         downloadedPiece = await downloadPieceFromPeer(peer, infoHashBuffer, pieceIndex, fileInfo.pieces, fileInfo["piece length"], fileInfo.length);
         break;
       } catch (error) {
+        console.error(`Failed to download from ${peer}: ${error.message}`);
         continue;
       }
     }
