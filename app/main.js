@@ -426,7 +426,7 @@ async function performMagnetHandshake(magnetLink) {
   }
 
   const infoHashBuffer = Buffer.from(parsedMagnetLink.infoHash, "hex");
-  const trackerResponse = await requestTracker(parsedMagnetLink.trackerUrl, infoHashBuffer, 0);
+  const trackerResponse = await requestTracker(parsedMagnetLink.trackerUrl, infoHashBuffer, 1);
   const decodedResponse = decodeBencode(trackerResponse);
 
   if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
