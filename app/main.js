@@ -5,31 +5,73 @@ const util = require("util");
 // - decodeBencode("5:hello") -> "hello"
 // - decodeBencode("10:hello12345") -> "hello12345"
 // - decodeBencode("i52e") -> 52
-function decodeBencode(bencodedValue) {
-  if (bencodedValue[0] === "i") {
-    const endIndex = bencodedValue.indexOf("e");
+// - decodeBencode("l5:helloi52ee") -> ["hello", 52]
+function decodeBencodeValue(bencodedValue, startIndex) {
+  const currentChar = bencodedValue[startIndex];
+
+  if (currentChar === "i") {
+    const endIndex = bencodedValue.indexOf("e", startIndex + 1);
     if (endIndex === -1) {
       throw new Error("Invalid encoded value");
     }
 
-    const integerString = bencodedValue.slice(1, endIndex);
-    if (integerString.length === 0) {
+    const integerString = bencodedValue.slice(startIndex + 1, endIndex);
+    if (!/^-?\d+$/.test(integerString)) {
       throw new Error("Invalid encoded value");
     }
 
-    return Number(integerString);
+    return { value: Number(integerString), nextIndex: endIndex + 1 };
   }
 
-  // Check if the first character is a digit
-  if (!isNaN(bencodedValue[0])) {
-    const firstColonIndex = bencodedValue.indexOf(":");
+  if (currentChar === "l") {
+    const values = [];
+    let index = startIndex + 1;
+
+    while (index < bencodedValue.length && bencodedValue[index] !== "e") {
+      const decodedValue = decodeBencodeValue(bencodedValue, index);
+      values.push(decodedValue.value);
+      index = decodedValue.nextIndex;
+    }
+
+    if (index >= bencodedValue.length || bencodedValue[index] !== "e") {
+      throw new Error("Invalid encoded value");
+    }
+
+    return { value: values, nextIndex: index + 1 };
+  }
+
+  if (!isNaN(currentChar)) {
+    const firstColonIndex = bencodedValue.indexOf(":", startIndex);
     if (firstColonIndex === -1) {
       throw new Error("Invalid encoded value");
     }
-    return bencodedValue.substr(firstColonIndex + 1);
-  } else {
-    throw new Error("Only strings and integers are supported at the moment");
+
+    const lengthString = bencodedValue.slice(startIndex, firstColonIndex);
+    if (!/^\d+$/.test(lengthString)) {
+      throw new Error("Invalid encoded value");
+    }
+
+    const length = Number(lengthString);
+    const value = bencodedValue.slice(firstColonIndex + 1, firstColonIndex + 1 + length);
+
+    if (value.length !== length) {
+      throw new Error("Invalid encoded value");
+    }
+
+    return { value, nextIndex: firstColonIndex + 1 + length };
   }
+
+  throw new Error("Unsupported bencoded value");
+}
+
+function decodeBencode(bencodedValue) {
+  const decodedValue = decodeBencodeValue(bencodedValue, 0);
+
+  if (decodedValue.nextIndex !== bencodedValue.length) {
+    throw new Error("Invalid encoded value");
+  }
+
+  return decodedValue.value;
 }
 
 function main() {
