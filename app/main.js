@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const net = require("net");
 const process = require("process");
 const util = require("util");
 
@@ -196,6 +197,62 @@ function parseCompactPeers(peersString) {
   return peers;
 }
 
+function createHandshake(infoHashBuffer) {
+  const protocolName = "BitTorrent protocol";
+  const protocolBuffer = Buffer.from(protocolName, "utf8");
+  const peerId = crypto.randomBytes(20);
+  const handshake = Buffer.alloc(1 + protocolBuffer.length + 8 + infoHashBuffer.length + peerId.length);
+
+  handshake[0] = protocolBuffer.length;
+  protocolBuffer.copy(handshake, 1);
+  // Reserved bytes are already zero-filled by Buffer.alloc.
+  infoHashBuffer.copy(handshake, 1 + protocolBuffer.length + 8);
+  peerId.copy(handshake, 1 + protocolBuffer.length + 8 + infoHashBuffer.length);
+
+  return { handshake, peerId };
+}
+
+function performHandshake(peerAddress, infoHashBuffer) {
+  return new Promise((resolve, reject) => {
+    const [host, portString] = peerAddress.split(":");
+    const port = Number(portString);
+
+    if (!host || Number.isNaN(port)) {
+      reject(new Error("Invalid peer address"));
+      return;
+    }
+
+    const socket = net.createConnection({ host, port });
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Handshake timed out"));
+    }, 5000);
+
+    socket.on("connect", () => {
+      const { handshake, peerId } = createHandshake(infoHashBuffer);
+      socket.write(handshake);
+    });
+
+    socket.on("data", (data) => {
+      clearTimeout(timeout);
+      if (data.length < 68) {
+        socket.destroy();
+        reject(new Error("Handshake response was too short"));
+        return;
+      }
+
+      const peerId = data.subarray(48, 68).toString("hex");
+      socket.end();
+      resolve(peerId);
+    });
+
+    socket.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
+
 async function main() {
   const command = process.argv[2];
 
@@ -269,6 +326,24 @@ async function main() {
     for (const peer of peers) {
       console.log(peer);
     }
+  } else if (command === "handshake") {
+    const torrentPath = process.argv[3];
+    const peerAddress = process.argv[4];
+    const torrentData = fs.readFileSync(torrentPath);
+    const decodedTorrent = decodeBencodeWithMetadata(torrentData);
+
+    if (!decodedTorrent.value || typeof decodedTorrent.value !== "object" || Array.isArray(decodedTorrent.value)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const fileInfo = decodedTorrent.value.info;
+    if (!fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+      throw new Error("Invalid torrent file");
+    }
+
+    const infoHashBuffer = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest();
+    const peerId = await performHandshake(peerAddress, infoHashBuffer);
+    console.log(`Peer ID: ${peerId}`);
   } else {
     throw new Error(`Unknown command ${command}`);
   }
