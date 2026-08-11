@@ -383,6 +383,59 @@ console.error(`Starting piece download for piece ${pieceIndex}`);
   return { peerId, pieceBuffer };
 }
 
+async function downloadFileFromTorrent(torrentPath, outputPath) {
+  const torrentData = fs.readFileSync(torrentPath);
+  const decodedTorrent = decodeBencodeWithMetadata(torrentData);
+
+  if (!decodedTorrent.value || typeof decodedTorrent.value !== "object" || Array.isArray(decodedTorrent.value)) {
+    throw new Error("Invalid torrent file");
+  }
+
+  const trackerUrl = decodedTorrent.value.announce;
+  const fileInfo = decodedTorrent.value.info;
+
+  if (typeof trackerUrl !== "string" || !fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+    throw new Error("Invalid torrent file");
+  }
+
+  const infoHashBuffer = crypto.createHash("sha1").update(decodedTorrent.infoRawBytes || Buffer.from([])).digest();
+  const trackerResponse = await requestTracker(trackerUrl, infoHashBuffer, fileInfo.length);
+  const decodedResponse = decodeBencode(trackerResponse);
+
+  if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+    throw new Error("Invalid tracker response");
+  }
+
+  const peers = parseCompactPeers(decodedResponse.peers);
+  const pieceHashes = fileInfo.pieces;
+  const pieceLength = fileInfo["piece length"];
+  const totalLength = fileInfo.length;
+  const numberOfPieces = Math.ceil(totalLength / pieceLength);
+  const fileBuffer = Buffer.alloc(totalLength);
+
+  for (let pieceIndex = 0; pieceIndex < numberOfPieces; pieceIndex += 1) {
+    let downloadedPiece = null;
+
+    for (const peer of peers) {
+      try {
+        downloadedPiece = await downloadPieceFromPeer(peer, infoHashBuffer, pieceIndex, pieceHashes, pieceLength, totalLength);
+        break;
+      } catch (error) {
+        continue;
+      }
+    }
+
+    if (!downloadedPiece) {
+      throw new Error(`Failed to download piece ${pieceIndex}`);
+    }
+
+    downloadedPiece.pieceBuffer.copy(fileBuffer, pieceIndex * pieceLength);
+  }
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, fileBuffer);
+}
+
 async function main() {
   const command = process.argv[2];
 
@@ -519,6 +572,10 @@ async function main() {
 
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     fs.writeFileSync(outputPath, downloadedPiece.pieceBuffer);
+  } else if (command === "download") {
+    const outputPath = process.argv[process.argv.indexOf("-o") + 1];
+    const torrentPath = process.argv[process.argv.indexOf("-o") + 2];
+    await downloadFileFromTorrent(torrentPath, outputPath);
   } else {
     throw new Error(`Unknown command ${command}`);
   }
