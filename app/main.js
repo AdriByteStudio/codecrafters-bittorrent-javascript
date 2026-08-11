@@ -198,6 +198,30 @@ function parseCompactPeers(peersString) {
   return peers;
 }
 
+function parseMagnetLink(magnetLink) {
+  const [uri, queryString] = magnetLink.split("?");
+  if (!queryString) {
+    throw new Error("Invalid magnet link");
+  }
+
+  const params = new URLSearchParams(queryString);
+  const xt = params.get("xt");
+  if (!xt || !xt.startsWith("urn:btih:")) {
+    throw new Error("Invalid magnet link");
+  }
+
+  const infoHash = xt.slice("urn:btih:".length);
+  if (!/^[0-9a-fA-F]{40}$/.test(infoHash)) {
+    throw new Error("Invalid info hash");
+  }
+
+  const trackerUrl = params.get("tr") || "";
+  return {
+    infoHash: infoHash.toLowerCase(),
+    trackerUrl,
+  };
+}
+
 function createHandshake(infoHashBuffer) {
   const protocolName = "BitTorrent protocol";
   const protocolBuffer = Buffer.from(protocolName, "utf8");
@@ -576,6 +600,11 @@ async function main() {
     const outputPath = process.argv[process.argv.indexOf("-o") + 1];
     const torrentPath = process.argv[process.argv.indexOf("-o") + 2];
     await downloadFileFromTorrent(torrentPath, outputPath);
+  } else if (command === "magnet_parse") {
+    const magnetLink = process.argv[3];
+    const parsedMagnetLink = parseMagnetLink(magnetLink);
+    console.log(`Tracker URL: ${parsedMagnetLink.trackerUrl}`);
+    console.log(`Info Hash: ${parsedMagnetLink.infoHash}`);
   } else {
     throw new Error(`Unknown command ${command}`);
   }
