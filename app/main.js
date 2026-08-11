@@ -282,7 +282,7 @@ function createMetadataRequestMessage(metadataExtensionId, pieceIndex = 0) {
 }
 
 function sendMetadataRequest(socket, metadataExtensionId, pieceIndex = 0) {
-  socket.write(createMetadataRequestMessage(metadataExtensionId, pieceIndex));
+  socket.end(createMetadataRequestMessage(metadataExtensionId, pieceIndex));
 }
 
 function parseExtensionHandshakeMessage(messagePayload) {
@@ -419,7 +419,6 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         handshakeComplete = true;
 
         if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
-          sendMessage(socket, 5, Buffer.alloc(0));
           socket.write(createExtensionHandshakeMessage());
           if (!waitForExtensionHandshakeResponse) {
             finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
