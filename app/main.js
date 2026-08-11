@@ -354,6 +354,30 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
     let initialBuffer = Buffer.alloc(0);
     let finished = false;
     let responseWaitTimer = null;
+
+    const processQueuedMessages = () => {
+      while (buffer.length >= 4) {
+        const { message, remainingBuffer } = parseMessageFromBuffer(buffer);
+        buffer = remainingBuffer;
+
+        if (!message) {
+          return false;
+        }
+
+        if (message.id === 20) {
+          metadataExtensionId = parseExtensionHandshakeMessage(message.payload);
+          if (metadataExtensionId !== null) {
+            if (responseWaitTimer) {
+              clearTimeout(responseWaitTimer);
+            }
+            finish({ socket, peerId, initialBuffer, metadataExtensionId });
+            return true;
+          }
+        }
+      }
+
+      return false;
+    };
     const finish = (result) => {
       if (finished) {
         return;
@@ -395,15 +419,20 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         handshakeComplete = true;
 
         if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
+          sendMessage(socket, 2);
           socket.write(createExtensionHandshakeMessage());
           if (!waitForExtensionHandshakeResponse) {
             finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
             return;
           }
 
+          if (processQueuedMessages()) {
+            return;
+          }
+
           responseWaitTimer = setTimeout(() => {
-            finish({ socket, peerId, metadataExtensionId: null });
-          }, 250);
+            finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
+          }, 1500);
           return;
         }
 
@@ -415,23 +444,9 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         return;
       }
 
-      while (buffer.length >= 4) {
-        const { message, remainingBuffer } = parseMessageFromBuffer(buffer);
-        buffer = remainingBuffer;
-
-        if (!message) {
+      if (handshakeComplete) {
+        if (processQueuedMessages()) {
           return;
-        }
-
-        if (message.id === 20) {
-          metadataExtensionId = parseExtensionHandshakeMessage(message.payload);
-          if (metadataExtensionId !== null) {
-            if (responseWaitTimer) {
-              clearTimeout(responseWaitTimer);
-            }
-            finish({ socket, peerId, initialBuffer, metadataExtensionId });
-            return;
-          }
         }
       }
     });
