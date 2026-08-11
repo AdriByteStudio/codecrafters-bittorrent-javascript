@@ -419,7 +419,6 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         handshakeComplete = true;
 
         if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
-          sendMessage(socket, 2);
           socket.write(createExtensionHandshakeMessage());
           if (!waitForExtensionHandshakeResponse) {
             finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
