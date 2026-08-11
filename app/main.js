@@ -4,7 +4,22 @@ const util = require("util");
 // Examples:
 // - decodeBencode("5:hello") -> "hello"
 // - decodeBencode("10:hello12345") -> "hello12345"
+// - decodeBencode("i52e") -> 52
 function decodeBencode(bencodedValue) {
+  if (bencodedValue[0] === "i") {
+    const endIndex = bencodedValue.indexOf("e");
+    if (endIndex === -1) {
+      throw new Error("Invalid encoded value");
+    }
+
+    const integerString = bencodedValue.slice(1, endIndex);
+    if (integerString.length === 0) {
+      throw new Error("Invalid encoded value");
+    }
+
+    return Number(integerString);
+  }
+
   // Check if the first character is a digit
   if (!isNaN(bencodedValue[0])) {
     const firstColonIndex = bencodedValue.indexOf(":");
@@ -13,7 +28,7 @@ function decodeBencode(bencodedValue) {
     }
     return bencodedValue.substr(firstColonIndex + 1);
   } else {
-    throw new Error("Only strings are supported at the moment");
+    throw new Error("Only strings and integers are supported at the moment");
   }
 }
 
