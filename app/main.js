@@ -335,6 +335,7 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
     let handshakeComplete = false;
     let peerId = null;
     let metadataExtensionId = null;
+    let initialBuffer = Buffer.alloc(0);
     let finished = false;
     let responseWaitTimer = null;
     const finish = (result) => {
@@ -373,13 +374,14 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         clearTimeout(timeout);
         const reservedBytes = buffer.subarray(20, 28);
         peerId = buffer.subarray(48, 68).toString("hex");
-        buffer = buffer.subarray(68);
+        initialBuffer = buffer.subarray(68);
+        buffer = initialBuffer;
         handshakeComplete = true;
 
         if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
           socket.write(createExtensionHandshakeMessage());
           if (!waitForExtensionHandshakeResponse) {
-            finish({ socket, peerId, metadataExtensionId: null });
+            finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
             return;
           }
 
@@ -393,7 +395,7 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
           socket.end();
         }
 
-        finish({ socket, peerId, metadataExtensionId: null });
+        finish({ socket, peerId, initialBuffer, metadataExtensionId: null });
         return;
       }
 
@@ -411,7 +413,7 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
             if (responseWaitTimer) {
               clearTimeout(responseWaitTimer);
             }
-            finish({ socket, peerId, metadataExtensionId });
+            finish({ socket, peerId, initialBuffer, metadataExtensionId });
             return;
           }
         }
