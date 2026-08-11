@@ -182,8 +182,18 @@ function requestTracker(trackerUrl, infoHashBuffer, left) {
   });
 }
 
-function parseCompactPeers(peersString) {
-  const peersBuffer = Buffer.from(peersString, "latin1");
+function parseCompactPeers(peersValue) {
+  if (!peersValue) {
+    return [];
+  }
+
+  if (Array.isArray(peersValue)) {
+    return peersValue
+      .filter((peer) => peer && typeof peer === "object" && typeof peer.ip === "string" && Number.isInteger(peer.port))
+      .map((peer) => `${peer.ip}:${peer.port}`);
+  }
+
+  const peersBuffer = Buffer.from(peersValue, "latin1");
   const peers = [];
 
   for (let index = 0; index + 6 <= peersBuffer.length; index += 6) {
@@ -226,13 +236,15 @@ function createHandshake(infoHashBuffer) {
   const protocolName = "BitTorrent protocol";
   const protocolBuffer = Buffer.from(protocolName, "utf8");
   const peerId = crypto.randomBytes(20);
-  const handshake = Buffer.alloc(1 + protocolBuffer.length + 8 + infoHashBuffer.length + peerId.length);
+  const reservedBytes = Buffer.alloc(8);
+  reservedBytes.writeUInt32BE(1 << 20, 4);
+  const handshake = Buffer.alloc(1 + protocolBuffer.length + reservedBytes.length + infoHashBuffer.length + peerId.length);
 
   handshake[0] = protocolBuffer.length;
   protocolBuffer.copy(handshake, 1);
-  // Reserved bytes are already zero-filled by Buffer.alloc.
-  infoHashBuffer.copy(handshake, 1 + protocolBuffer.length + 8);
-  peerId.copy(handshake, 1 + protocolBuffer.length + 8 + infoHashBuffer.length);
+  reservedBytes.copy(handshake, 1 + protocolBuffer.length);
+  infoHashBuffer.copy(handshake, 1 + protocolBuffer.length + reservedBytes.length);
+  peerId.copy(handshake, 1 + protocolBuffer.length + reservedBytes.length + infoHashBuffer.length);
 
   return { handshake, peerId };
 }
@@ -405,6 +417,38 @@ console.error(`Starting piece download for piece ${pieceIndex}`);
 
   socket.end();
   return { peerId, pieceBuffer };
+}
+
+async function performMagnetHandshake(magnetLink) {
+  const parsedMagnetLink = parseMagnetLink(magnetLink);
+  if (!parsedMagnetLink.trackerUrl) {
+    throw new Error("Magnet link is missing a tracker URL");
+  }
+
+  const infoHashBuffer = Buffer.from(parsedMagnetLink.infoHash, "hex");
+  const trackerResponse = await requestTracker(parsedMagnetLink.trackerUrl, infoHashBuffer, 0);
+  const decodedResponse = decodeBencode(trackerResponse);
+
+  if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+    throw new Error("Invalid tracker response");
+  }
+
+  const peers = parseCompactPeers(decodedResponse.peers);
+  if (peers.length === 0) {
+    throw new Error("No peers returned by tracker");
+  }
+
+  let lastError = null;
+  for (const peer of peers) {
+    try {
+      const { peerId } = await performHandshake(peer, infoHashBuffer);
+      return peerId;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Failed to complete magnet handshake");
 }
 
 async function downloadFileFromTorrent(torrentPath, outputPath) {
@@ -605,6 +649,10 @@ async function main() {
     const parsedMagnetLink = parseMagnetLink(magnetLink);
     console.log(`Tracker URL: ${parsedMagnetLink.trackerUrl}`);
     console.log(`Info Hash: ${parsedMagnetLink.infoHash}`);
+  } else if (command === "magnet_handshake") {
+    const magnetLink = process.argv[3];
+    const peerId = await performMagnetHandshake(magnetLink);
+    console.log(`Peer ID: ${peerId}`);
   } else {
     throw new Error(`Unknown command ${command}`);
   }
