@@ -269,6 +269,22 @@ function createExtensionHandshakeMessage() {
   return messageBuffer;
 }
 
+function createMetadataRequestMessage(metadataExtensionId, pieceIndex = 0) {
+  const payload = Buffer.concat([
+    Buffer.from([metadataExtensionId]),
+    Buffer.from(`d8:msg_typei0e5:piecei${pieceIndex}ee`, "latin1"),
+  ]);
+  const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
+  messageBuffer.writeUInt32BE(payload.length + 1, 0);
+  messageBuffer[4] = 20;
+  payload.copy(messageBuffer, 5);
+  return messageBuffer;
+}
+
+function sendMetadataRequest(socket, metadataExtensionId, pieceIndex = 0) {
+  socket.write(createMetadataRequestMessage(metadataExtensionId, pieceIndex));
+}
+
 function parseExtensionHandshakeMessage(messagePayload) {
   if (!Buffer.isBuffer(messagePayload) || messagePayload.length < 2) {
     return null;
@@ -788,6 +804,48 @@ async function main() {
     const parsedMagnetLink = parseMagnetLink(magnetLink);
     console.log(`Tracker URL: ${parsedMagnetLink.trackerUrl}`);
     console.log(`Info Hash: ${parsedMagnetLink.infoHash}`);
+  } else if (command === "magnet_info") {
+    const magnetLink = process.argv[3];
+    const parsedMagnetLink = parseMagnetLink(magnetLink);
+    if (!parsedMagnetLink.trackerUrl) {
+      throw new Error("Magnet link is missing a tracker URL");
+    }
+
+    const infoHashBuffer = Buffer.from(parsedMagnetLink.infoHash, "hex");
+    const trackerResponse = await requestTracker(parsedMagnetLink.trackerUrl, infoHashBuffer, 1);
+    const decodedResponse = decodeBencode(trackerResponse);
+
+    if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+      throw new Error("Invalid tracker response");
+    }
+
+    const peers = parseCompactPeers(decodedResponse.peers);
+    if (peers.length === 0) {
+      throw new Error("No peers returned by tracker");
+    }
+
+    let lastError = null;
+    for (const peer of peers) {
+      try {
+        const { socket, metadataExtensionId } = await performHandshake(peer, infoHashBuffer, {
+          sendExtensionHandshake: true,
+          closeAfterHandshake: false,
+          waitForExtensionHandshakeResponse: true,
+        });
+
+        if (metadataExtensionId === null) {
+          throw new Error("Peer did not advertise metadata extension support");
+        }
+
+        sendMetadataRequest(socket, metadataExtensionId);
+        socket.end();
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError || new Error("Failed to complete metadata request");
   } else if (command === "magnet_handshake") {
     const magnetLink = process.argv[3];
     const { peerId, metadataExtensionId } = await performMagnetHandshake(magnetLink);
