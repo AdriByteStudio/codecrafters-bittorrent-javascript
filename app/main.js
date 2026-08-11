@@ -269,8 +269,58 @@ function createExtensionHandshakeMessage() {
   return messageBuffer;
 }
 
+function parseExtensionHandshakeMessage(messagePayload) {
+  if (!Buffer.isBuffer(messagePayload) || messagePayload.length < 2) {
+    return null;
+  }
+
+  const extensionMessageId = messagePayload[0];
+  if (extensionMessageId !== 0) {
+    return null;
+  }
+
+  const bencodedPayload = messagePayload.subarray(1);
+  const decodedPayload = decodeBencode(bencodedPayload);
+  if (!decodedPayload || typeof decodedPayload !== "object" || Array.isArray(decodedPayload)) {
+    return null;
+  }
+
+  const mapping = decodedPayload.m;
+  if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+    return null;
+  }
+
+  const metadataId = mapping.ut_metadata;
+  if (typeof metadataId !== "number" || metadataId <= 0 || metadataId > 255) {
+    return null;
+  }
+
+  return metadataId;
+}
+
+function parseMessageFromBuffer(buffer) {
+  if (buffer.length < 4) {
+    return { message: null, remainingBuffer: buffer };
+  }
+
+  const length = buffer.readUInt32BE(0);
+  if (buffer.length < 4 + length) {
+    return { message: null, remainingBuffer: buffer };
+  }
+
+  const messageBuffer = buffer.subarray(4, 4 + length);
+  return {
+    message: {
+      length,
+      id: messageBuffer[0],
+      payload: messageBuffer.subarray(1),
+    },
+    remainingBuffer: buffer.subarray(4 + length),
+  };
+}
+
 function performHandshake(peerAddress, infoHashBuffer, options = {}) {
-  const { sendExtensionHandshake = false, closeAfterHandshake = false } = options;
+  const { sendExtensionHandshake = false, closeAfterHandshake = false, waitForExtensionHandshakeResponse = false } = options;
   return new Promise((resolve, reject) => {
     const [host, portString] = peerAddress.split(":");
     const port = Number(portString);
@@ -282,6 +332,26 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
 
     const socket = net.createConnection({ host, port });
     let buffer = Buffer.alloc(0);
+    let handshakeComplete = false;
+    let peerId = null;
+    let metadataExtensionId = null;
+    let finished = false;
+    let responseWaitTimer = null;
+    const finish = (result) => {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      clearTimeout(timeout);
+      if (responseWaitTimer) {
+        clearTimeout(responseWaitTimer);
+      }
+      if (closeAfterHandshake) {
+        socket.destroy();
+      }
+      resolve(result);
+    };
     const timeout = setTimeout(() => {
       socket.destroy();
       reject(new Error("Handshake timed out"));
@@ -294,22 +364,57 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
 
     socket.on("data", (data) => {
       buffer = Buffer.concat([buffer, data]);
-      if (buffer.length >= 68) {
-        clearTimeout(timeout);
-        const reservedBytes = buffer.subarray(20, 28);
-        const peerId = buffer.subarray(48, 68).toString("hex");
-        const remainingBuffer = buffer.subarray(68);
 
-        if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
-          socket.write(createExtensionHandshakeMessage());
-          if (closeAfterHandshake) {
-            socket.end();
-          }
-          resolve({ socket, peerId, initialBuffer: remainingBuffer });
+      if (!handshakeComplete) {
+        if (buffer.length < 68) {
           return;
         }
 
-        resolve({ socket, peerId, initialBuffer: remainingBuffer });
+        clearTimeout(timeout);
+        const reservedBytes = buffer.subarray(20, 28);
+        peerId = buffer.subarray(48, 68).toString("hex");
+        buffer = buffer.subarray(68);
+        handshakeComplete = true;
+
+        if (sendExtensionHandshake && parseExtensionSupport(reservedBytes)) {
+          socket.write(createExtensionHandshakeMessage());
+          if (!waitForExtensionHandshakeResponse) {
+            finish({ socket, peerId, metadataExtensionId: null });
+            return;
+          }
+
+          responseWaitTimer = setTimeout(() => {
+            finish({ socket, peerId, metadataExtensionId: null });
+          }, 250);
+          return;
+        }
+
+        if (closeAfterHandshake) {
+          socket.end();
+        }
+
+        finish({ socket, peerId, metadataExtensionId: null });
+        return;
+      }
+
+      while (buffer.length >= 4) {
+        const { message, remainingBuffer } = parseMessageFromBuffer(buffer);
+        buffer = remainingBuffer;
+
+        if (!message) {
+          return;
+        }
+
+        if (message.id === 20) {
+          metadataExtensionId = parseExtensionHandshakeMessage(message.payload);
+          if (metadataExtensionId !== null) {
+            if (responseWaitTimer) {
+              clearTimeout(responseWaitTimer);
+            }
+            finish({ socket, peerId, metadataExtensionId });
+            return;
+          }
+        }
       }
     });
 
@@ -473,8 +578,8 @@ async function performMagnetHandshake(magnetLink) {
   let lastError = null;
   for (const peer of peers) {
     try {
-      const { peerId } = await performHandshake(peer, infoHashBuffer, { sendExtensionHandshake: true, closeAfterHandshake: true });
-      return peerId;
+      const { peerId, metadataExtensionId } = await performHandshake(peer, infoHashBuffer, { sendExtensionHandshake: true, closeAfterHandshake: true, waitForExtensionHandshakeResponse: true });
+      return { peerId, metadataExtensionId };
     } catch (error) {
       lastError = error;
     }
@@ -683,8 +788,11 @@ async function main() {
     console.log(`Info Hash: ${parsedMagnetLink.infoHash}`);
   } else if (command === "magnet_handshake") {
     const magnetLink = process.argv[3];
-    const peerId = await performMagnetHandshake(magnetLink);
+    const { peerId, metadataExtensionId } = await performMagnetHandshake(magnetLink);
     console.log(`Peer ID: ${peerId}`);
+    if (metadataExtensionId !== null) {
+      console.log(`Peer Metadata Extension ID: ${metadataExtensionId}`);
+    }
   } else {
     throw new Error(`Unknown command ${command}`);
   }
