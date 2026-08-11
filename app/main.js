@@ -399,7 +399,6 @@ function parseMetadataResponseMessage(messagePayload, expectedExtensionMessageId
 }
 
 async function receiveMetadataPiece(reader, expectedExtensionMessageId, timeoutMs = 5000) {
-  console.error(`receiveMetadataPiece: waiting for metadata with expectedExtensionMessageId=${expectedExtensionMessageId}`);
   const timeoutPromise = new Promise((_, reject) => {
     setTimeout(() => reject(new Error("Timed out waiting for metadata response")), timeoutMs);
   });
@@ -415,29 +414,23 @@ async function receiveMetadataPiece(reader, expectedExtensionMessageId, timeoutM
       ]);
 
       if (message && message.id === 20) {
-        console.error(`receiveMetadataPiece: received message id=20, payload length=${message.payload.length}, first 20 bytes hex=${message.payload.subarray(0, 20).toString("hex")}`);
         if (message.payload[0] === 0) {
           // Skip extension handshake responses
-          console.error(`receiveMetadataPiece: skipping extension handshake`);
           continue;
         }
 
         const parsedMetadata = parseMetadataResponseMessage(message.payload, ourAdvertisedExtensionId);
-        console.error(`receiveMetadataPiece: parseMetadataResponseMessage returned ${parsedMetadata ? "success" : "null"}`);
         if (parsedMetadata) {
           return parsedMetadata;
         } else {
           // Parse failed, continue waiting
-          console.error(`receiveMetadataPiece: parse returned null, continuing`);
           continue;
         }
       } else if (message) {
         // Non-extension message, requeue for later
-        console.error(`receiveMetadataPiece: got non-extension message id=${message.id}, requeuing`);
         reader.requeue(message);
       }
     } catch (error) {
-      console.error(`receiveMetadataPiece: caught error: ${error.message}`);
       if (error && error.message === "Socket closed") {
         throw new Error("Peer closed connection before sending metadata");
       }
@@ -455,7 +448,6 @@ async function fetchMetadataInfo(reader, socket, metadataExtensionId, timeoutMs 
   // The peer will send responses using OUR advertised ID (1)
 
   while (true) {
-    console.error(`fetchMetadataInfo: sending request for piece ${pieceIndex} with extensionId=${metadataExtensionId}`);
     sendMetadataRequest(socket, metadataExtensionId, pieceIndex);
     const response = await receiveMetadataPiece(reader, null, timeoutMs);  // Pass null, function will use our advertised ID
 
@@ -517,7 +509,6 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
         if (message.id === 20) {
           metadataExtensionId = parseExtensionHandshakeMessage(message.payload);
           if (metadataExtensionId !== null) {
-            console.error(`Parsed extension handshake, metadataExtensionId=${metadataExtensionId}`);
             if (responseWaitTimer) {
               clearTimeout(responseWaitTimer);
             }
@@ -686,7 +677,7 @@ function sendMessage(socket, messageId, payload = Buffer.alloc(0)) {
   socket.write(messageBuffer);
 }
 
-async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength, peerId = null) {
+async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength, peerId = null, closeSocket = true) {
   // First, send interested message (id=2)
   sendMessage(socket, 2);
   
@@ -701,15 +692,28 @@ async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, 
   const pieceSize = pieceIndex + 1 === Math.ceil(totalLength / pieceLength) ? totalLength - pieceIndex * pieceLength : pieceLength;
   const pieceBuffer = Buffer.alloc(pieceSize);
   let offset = 0;
+  
+  // Pipelining: keep up to 5 requests pending
+  const pendingRequests = new Map();
+  const maxPendingRequests = 5;
 
-  while (offset < pieceSize) {
-    const blockLength = Math.min(blockSize, pieceSize - offset);
-    const requestPayload = Buffer.alloc(12);
-    requestPayload.writeUInt32BE(pieceIndex, 0);
-    requestPayload.writeUInt32BE(offset, 4);
-    requestPayload.writeUInt32BE(blockLength, 8);
-    sendMessage(socket, 6, requestPayload);
+  while (offset < pieceSize || pendingRequests.size > 0) {
+    // Send new requests to fill up to maxPendingRequests
+    while (offset < pieceSize && pendingRequests.size < maxPendingRequests) {
+      const blockLength = Math.min(blockSize, pieceSize - offset);
+      const blockOffset = offset;
+      
+      const requestPayload = Buffer.alloc(12);
+      requestPayload.writeUInt32BE(pieceIndex, 0);
+      requestPayload.writeUInt32BE(blockOffset, 4);
+      requestPayload.writeUInt32BE(blockLength, 8);
+      sendMessage(socket, 6, requestPayload);
+      
+      pendingRequests.set(`${blockOffset}`, blockLength);
+      offset += blockLength;
+    }
 
+    // Read response
     const pieceMessage = await reader.readMessage();
     if (pieceMessage.id !== 7) {
       continue;
@@ -724,12 +728,17 @@ async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, 
     const begin = payload.readUInt32BE(4);
     const block = payload.subarray(8);
 
-    if (messagePieceIndex !== pieceIndex || begin !== offset) {
-      throw new Error("Unexpected piece message payload");
+    if (messagePieceIndex !== pieceIndex) {
+      throw new Error("Unexpected piece message payload - piece index mismatch");
+    }
+
+    const blockKey = `${begin}`;
+    if (!pendingRequests.has(blockKey)) {
+      throw new Error("Received block that wasn't requested");
     }
 
     block.copy(pieceBuffer, begin);
-    offset += block.length;
+    pendingRequests.delete(blockKey);
   }
 
   const expectedHash = Buffer.from(pieceHashes.slice(pieceIndex * 20, pieceIndex * 20 + 20), "latin1").toString("hex");
@@ -738,7 +747,9 @@ async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, 
     throw new Error("Downloaded piece hash mismatch");
   }
 
-  socket.end();
+  if (closeSocket) {
+    socket.end();
+  }
   return { peerId, pieceBuffer };
 }
 
@@ -1097,6 +1108,65 @@ async function main() {
     }
 
     throw lastError || new Error("Failed to download piece from any peer");
+  } else if (command === "magnet_download") {
+    const outputPath = process.argv[process.argv.indexOf("-o") + 1];
+    const magnetLink = process.argv[process.argv.indexOf("-o") + 2];
+    const parsedMagnetLink = parseMagnetLink(magnetLink);
+
+    if (!parsedMagnetLink.trackerUrl) {
+      throw new Error("Magnet link is missing a tracker URL");
+    }
+
+    const infoHashBuffer = Buffer.from(parsedMagnetLink.infoHash, "hex");
+    const trackerResponse = await requestTracker(parsedMagnetLink.trackerUrl, infoHashBuffer, 1);
+    const decodedResponse = decodeBencode(trackerResponse);
+
+    if (!decodedResponse || typeof decodedResponse !== "object" || Array.isArray(decodedResponse)) {
+      throw new Error("Invalid tracker response");
+    }
+
+    const peers = parseCompactPeers(decodedResponse.peers);
+    if (peers.length === 0) {
+      throw new Error("No peers returned by tracker");
+    }
+
+    let lastError = null;
+    for (const peer of peers) {
+      try {
+        const { socket, initialBuffer, metadataExtensionId } = await performHandshake(peer, infoHashBuffer, {
+          sendExtensionHandshake: true,
+          closeAfterHandshake: false,
+          waitForExtensionHandshakeResponse: true,
+        });
+
+        if (metadataExtensionId === null) {
+          throw new Error("Peer did not advertise metadata extension support");
+        }
+
+        const reader = createMessageReader(socket, initialBuffer);
+        const { info } = await fetchMetadataInfo(reader, socket, metadataExtensionId, 1000);
+        const pieceHashes = info.pieces;
+        const pieceLength = info["piece length"];
+        const totalLength = info.length;
+        const numberOfPieces = Math.ceil(totalLength / pieceLength);
+        const fileBuffer = Buffer.alloc(totalLength);
+
+        // Download all pieces
+        for (let pieceIndex = 0; pieceIndex < numberOfPieces; pieceIndex += 1) {
+          const isLastPiece = pieceIndex === numberOfPieces - 1;
+          const downloadedPiece = await downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength, null, isLastPiece);
+          downloadedPiece.pieceBuffer.copy(fileBuffer, pieceIndex * pieceLength);
+        }
+
+        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+        fs.writeFileSync(outputPath, fileBuffer);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError || new Error("Failed to download file from any peer");
   } else if (command === "magnet_handshake") {
     const magnetLink = process.argv[3];
     const { peerId, metadataExtensionId } = await performMagnetHandshake(magnetLink);
