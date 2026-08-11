@@ -349,46 +349,63 @@ function parseMetadataResponseMessage(messagePayload, expectedExtensionMessageId
   }
 
   const extensionMessageId = messagePayload[0];
-  if (extensionMessageId !== 0) {
+
+  if (extensionMessageId !== expectedExtensionMessageId) {
     return null;
   }
 
   const payload = messagePayload.subarray(1);
+
   const firstByte = payload[0];
-  let decodedValue = null;
 
-  if (firstByte === 0x64) {
-    try {
-      decodedValue = decodeBencodeValue(payload, 0);
-    } catch (error) {
-      return null;
-    }
-
-    const metadataMessage = decodedValue.value;
-    if (!metadataMessage || typeof metadataMessage !== "object" || Array.isArray(metadataMessage)) {
-      return null;
-    }
-
+  if (firstByte !== 0x64) {
     return {
-      metadataMessage,
-      metadataPieceBytes: payload.subarray(decodedValue.nextIndex),
-      metadataPieceIndex: Number(metadataMessage.piece),
-      totalSize: Number(metadataMessage.total_size),
+      metadataMessage: null,
+      metadataPieceBytes: payload,
+      metadataPieceIndex: 0,
+      totalSize: payload.length,
     };
   }
 
+  let decodedValue;
+
+  try {
+    decodedValue = decodeBencodeValue(payload, 0);
+  } catch (error) {
+    return null;
+  }
+
+  const metadataMessage = decodedValue.value;
+
+  if (!metadataMessage || typeof metadataMessage !== "object" || Array.isArray(metadataMessage)) {
+    return null;
+  }
+
+  const metadataPieceIndex = Number(metadataMessage.piece);
+  const totalSize = metadataMessage.total_size !== undefined ? Number(metadataMessage.total_size) : null;
+
+  if (!Number.isInteger(metadataPieceIndex)) {
+    return null;
+  }
+
+  const metadataPieceBytes = payload.subarray(decodedValue.nextIndex);
+
   return {
-    metadataMessage: null,
-    metadataPieceBytes: payload,
-    metadataPieceIndex: 0,
-    totalSize: payload.length,
+    metadataMessage,
+    metadataPieceBytes,
+    metadataPieceIndex,
+    totalSize,
   };
 }
 
 async function receiveMetadataPiece(reader, expectedExtensionMessageId, timeoutMs = 5000) {
+  console.error(`receiveMetadataPiece: waiting for metadata with expectedExtensionMessageId=${expectedExtensionMessageId}`);
   const timeoutPromise = new Promise((_, reject) => {
     setTimeout(() => reject(new Error("Timed out waiting for metadata response")), timeoutMs);
   });
+  
+  // Note: the peer will send metadata responses using OUR advertised extension ID (1), not theirs
+  const ourAdvertisedExtensionId = 1;
 
   while (true) {
     try {
@@ -398,15 +415,29 @@ async function receiveMetadataPiece(reader, expectedExtensionMessageId, timeoutM
       ]);
 
       if (message && message.id === 20) {
-        const parsedMetadata = parseMetadataResponseMessage(message.payload, expectedExtensionMessageId);
-        console.error(`metadata parse result=${parsedMetadata ? "parsed" : "null"}`);
+        console.error(`receiveMetadataPiece: received message id=20, payload length=${message.payload.length}, first 20 bytes hex=${message.payload.subarray(0, 20).toString("hex")}`);
+        if (message.payload[0] === 0) {
+          // Skip extension handshake responses
+          console.error(`receiveMetadataPiece: skipping extension handshake`);
+          continue;
+        }
+
+        const parsedMetadata = parseMetadataResponseMessage(message.payload, ourAdvertisedExtensionId);
+        console.error(`receiveMetadataPiece: parseMetadataResponseMessage returned ${parsedMetadata ? "success" : "null"}`);
         if (parsedMetadata) {
           return parsedMetadata;
+        } else {
+          // Parse failed, continue waiting
+          console.error(`receiveMetadataPiece: parse returned null, continuing`);
+          continue;
         }
       } else if (message) {
+        // Non-extension message, requeue for later
+        console.error(`receiveMetadataPiece: got non-extension message id=${message.id}, requeuing`);
         reader.requeue(message);
       }
     } catch (error) {
+      console.error(`receiveMetadataPiece: caught error: ${error.message}`);
       if (error && error.message === "Socket closed") {
         throw new Error("Peer closed connection before sending metadata");
       }
@@ -420,9 +451,14 @@ async function fetchMetadataInfo(reader, socket, metadataExtensionId, timeoutMs 
   let totalSize = null;
   let pieceIndex = 0;
 
+  // Note: metadataExtensionId here is the peer's advertised ID, which we use for SENDING requests
+  // The peer will send responses using OUR advertised ID (1)
+
   while (true) {
+    console.error(`fetchMetadataInfo: sending request for piece ${pieceIndex} with extensionId=${metadataExtensionId}`);
     sendMetadataRequest(socket, metadataExtensionId, pieceIndex);
-    const response = await receiveMetadataPiece(reader, metadataExtensionId, timeoutMs);
+    const response = await receiveMetadataPiece(reader, null, timeoutMs);  // Pass null, function will use our advertised ID
+
     metadataPieces.set(response.metadataPieceIndex, response.metadataPieceBytes);
 
     if (typeof response.totalSize === "number") {
@@ -468,9 +504,11 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
     let responseWaitTimer = null;
 
     const processQueuedMessages = () => {
-      while (buffer.length >= 4) {
-        const { message, remainingBuffer } = parseMessageFromBuffer(buffer);
-        buffer = remainingBuffer;
+      let cursor = Buffer.from(buffer);
+
+      while (cursor.length >= 4) {
+        const { message, remainingBuffer } = parseMessageFromBuffer(cursor);
+        cursor = remainingBuffer;
 
         if (!message) {
           return false;
@@ -478,11 +516,12 @@ function performHandshake(peerAddress, infoHashBuffer, options = {}) {
 
         if (message.id === 20) {
           metadataExtensionId = parseExtensionHandshakeMessage(message.payload);
-          console.error(`Parsed extension handshake, metadataExtensionId=${metadataExtensionId}`);
           if (metadataExtensionId !== null) {
+            console.error(`Parsed extension handshake, metadataExtensionId=${metadataExtensionId}`);
             if (responseWaitTimer) {
               clearTimeout(responseWaitTimer);
             }
+            initialBuffer = cursor;  // Use the remaining buffer after consuming the extension handshake
             finish({ socket, peerId, initialBuffer, metadataExtensionId });
             return true;
           }
@@ -613,7 +652,6 @@ function createMessageReader(socket, initialBuffer = Buffer.alloc(0)) {
         payload: messageBuffer.subarray(1),
       };
 
-      console.error(`Received message id=${message.id} length=${message.length}`);
       queuedMessages.push(message);
       while (queuedMessages.length > 0 && pending.length > 0) {
         const next = pending.shift();
@@ -642,7 +680,6 @@ function createMessageReader(socket, initialBuffer = Buffer.alloc(0)) {
 
 function sendMessage(socket, messageId, payload = Buffer.alloc(0)) {
   const messageBuffer = Buffer.alloc(4 + 1 + payload.length);
-  console.error(`Sending message id=${messageId}`);
   messageBuffer.writeUInt32BE(1 + payload.length, 0);
   messageBuffer[4] = messageId;
   payload.copy(messageBuffer, 5);
@@ -650,17 +687,13 @@ function sendMessage(socket, messageId, payload = Buffer.alloc(0)) {
 }
 
 async function downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength, peerId = null) {
-  console.error(`Starting piece download for piece ${pieceIndex}`);
-  let message = await reader.readMessage();
-  while (message.id !== 5 && message.id !== 1) {
-    console.error(`Skipping unexpected message id=${message.id}`);
-    message = await reader.readMessage();
-  }
-
+  // First, send interested message (id=2)
   sendMessage(socket, 2);
-
+  
+  // Now wait for unchoke (id=1)
+  let message = await reader.readMessage();
+  
   while (message.id !== 1) {
-    console.error(`Waiting for unchoke, got id=${message.id}`);
     message = await reader.readMessage();
   }
 
@@ -979,8 +1012,6 @@ async function main() {
         }
 
         const reader = createMessageReader(socket, initialBuffer);
-        sendMetadataRequest(socket, metadataExtensionId);
-
         try {
           const { info, infoRawBytes } = await fetchMetadataInfo(reader, socket, metadataExtensionId, 1000);
           const infoHash = crypto.createHash("sha1").update(infoRawBytes).digest("hex");
@@ -1055,72 +1086,10 @@ async function main() {
         const pieceHashes = info.pieces;
         const pieceLength = info["piece length"];
         const totalLength = info.length;
-
-        let message = await reader.readMessage();
-        console.error(`post-metadata first message id=${message.id}`);
-        while (message.id !== 5 && message.id !== 1) {
-          console.error(`skipping message id=${message.id}`);
-          message = await reader.readMessage();
-        }
-
-        sendMessage(socket, 2);
-        console.error("sent interested");
-
-        while (message.id !== 1) {
-          console.error(`waiting for unchoke, got id=${message.id}`);
-          if (message.id === 5) {
-            message = await reader.readMessage();
-            continue;
-          }
-          message = await reader.readMessage();
-        }
-
-        const blockSize = 16 * 1024;
-        const pieceSize = pieceIndex + 1 === Math.ceil(totalLength / pieceLength) ? totalLength - pieceIndex * pieceLength : pieceLength;
-        const pieceBuffer = Buffer.alloc(pieceSize);
-        let offset = 0;
-
-        while (offset < pieceSize) {
-          const blockLength = Math.min(blockSize, pieceSize - offset);
-          const requestPayload = Buffer.alloc(12);
-          requestPayload.writeUInt32BE(pieceIndex, 0);
-          requestPayload.writeUInt32BE(offset, 4);
-          requestPayload.writeUInt32BE(blockLength, 8);
-          sendMessage(socket, 6, requestPayload);
-
-          let pieceMessage = null;
-          while (true) {
-            pieceMessage = await reader.readMessage();
-            if (pieceMessage.id === 7) {
-              break;
-            }
-          }
-
-          const payload = pieceMessage.payload;
-          if (payload.length < 8) {
-            throw new Error("Invalid piece message");
-          }
-
-          const messagePieceIndex = payload.readUInt32BE(0);
-          const begin = payload.readUInt32BE(4);
-          const block = payload.subarray(8);
-
-          if (messagePieceIndex !== pieceIndex || begin !== offset) {
-            throw new Error("Unexpected piece message payload");
-          }
-
-          block.copy(pieceBuffer, begin);
-          offset += block.length;
-        }
-
-        const expectedHash = Buffer.from(pieceHashes.slice(pieceIndex * 20, pieceIndex * 20 + 20), "latin1").toString("hex");
-        const actualHash = crypto.createHash("sha1").update(pieceBuffer).digest("hex");
-        if (actualHash !== expectedHash) {
-          throw new Error("Downloaded piece hash mismatch");
-        }
+        const downloadedPiece = await downloadPieceFromSocket(socket, reader, pieceIndex, pieceHashes, pieceLength, totalLength);
 
         fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-        fs.writeFileSync(outputPath, pieceBuffer);
+        fs.writeFileSync(outputPath, downloadedPiece.pieceBuffer);
         return;
       } catch (error) {
         lastError = error;
